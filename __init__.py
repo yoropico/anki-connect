@@ -147,6 +147,11 @@ class AnkiConnect:
         self.logEvent('reply', reply)
         return reply
 
+    def _dispatch_webhook_event(self, event_name, event_data):
+        webhooks = util.get_webhooks()
+        for webhook in webhooks:
+            if event_name in webhook['events']:
+                util.send_webhook_post(webhook['url'], event_name, event_data)
 
     def window(self):
         return aqt.mw
@@ -510,12 +515,34 @@ class AnkiConnect:
         if out.required not in accepted_sync_statuses:
             raise Exception(f"Sync status {out.required} not one of {accepted_sync_statuses} - see SyncCollectionResponse.ChangesRequired for list of sync statuses: https://github.com/ankitects/anki/blob/e41c4573d789afe8b020fab5d9d1eede50c3fa3d/proto/anki/sync.proto#L57-L65")
         mw.onSync()
+        self._dispatch_webhook_event('syncCompleted', {'status': 'success'}) # Webhook
 
 
     @util.api()
     def multi(self, actions):
         return list(map(self.handler, actions))
 
+    @util.api()
+    def registerWebhook(self, url, events):
+        if not isinstance(url, str) or not url:
+            raise Exception("URL must be a non-empty string.")
+        if not isinstance(events, list) or not all(isinstance(e, str) for e in events):
+            raise Exception("Events must be a list of strings.")
+        
+        util.add_webhook(url, events)
+        return True
+
+    @util.api()
+    def unregisterWebhook(self, url):
+        if not isinstance(url, str) or not url:
+            raise Exception("URL must be a non-empty string.")
+        
+        util.remove_webhook(url)
+        return True
+
+    @util.api()
+    def getWebhooks(self):
+        return util.get_webhooks()
 
     @util.api()
     def getNumCardsReviewedToday(self):
@@ -689,6 +716,18 @@ class AnkiConnect:
         return responseDict
 
     @util.api()
+    def getDeckStatsByName(self, decks):
+        deck_ids = [self.decks().id(deck_name) for deck_name in decks]
+        stats = self.getDeckStats(deck_ids)
+        
+        result = {}
+        for deck_id, deck_stats in stats.items():
+            deck_name = self.deckNameFromId(deck_id)
+            result[deck_name] = deck_stats
+            
+        return result
+
+    @util.api()
     def storeMediaFile(self, filename, data=None, path=None, url=None, skipHash=None, deleteExisting=True):
         if not (data or path or url):
             raise Exception('You must provide a "data", "path", or "url" field.')
@@ -751,8 +790,26 @@ class AnkiConnect:
         nCardsAdded = collection.addNote(ankiNote)
         if nCardsAdded < 1:
             raise Exception('The field values you have provided would make an empty question on all cards.')
-
+        
+        self._dispatch_webhook_event('noteAdded', {'noteId': ankiNote.id, 'note': ankiNote.fields}) # Webhook
         return ankiNote.id
+
+
+    @util.api()
+    def addNotes(self, notes):
+        self.startEditing()
+        ids = []
+        for note in notes:
+            ankiNote = self.createNote(note)
+            
+            collection = self.collection()
+            nCardsAdded = collection.addNote(ankiNote)
+            if nCardsAdded < 1:
+                raise Exception('The field values you have provided would make an empty question on all cards.')
+            
+            self._dispatch_webhook_event('noteAdded', {'noteId': ankiNote.id, 'note': ankiNote.fields}) # Webhook
+            ids.append(ankiNote.id)
+        return ids
 
 
     def addMediaFromNote(self, ankiNote, note):
@@ -832,6 +889,7 @@ class AnkiConnect:
         self.addMediaFromNote(ankiNote, note)
 
         self.collection().update_note(ankiNote, skip_undo_entry=True);
+        self._dispatch_webhook_event('noteUpdated', {'noteId': ankiNote.id, 'note': ankiNote.fields}) # Webhook
 
 
     @util.api()
@@ -845,6 +903,37 @@ class AnkiConnect:
             updated = True
         if not updated:
             raise Exception('Must provide a "fields" or "tags" property.')
+
+    @util.api()
+    def updateNotes(self, notes):
+        self.startEditing()
+        count = 0
+        for note_data in notes:
+            note_id = note_data.get('id')
+            if not note_id:
+                continue
+
+            try:
+                anki_note = self.getNote(note_id)
+                
+                if 'fields' in note_data:
+                    fields = note_data['fields']
+                    for name, value in fields.items():
+                        if name in anki_note:
+                            anki_note[name] = value
+                    
+                    self.addMediaFromNote(anki_note, note_data)
+
+                if 'tags' in note_data:
+                    anki_note.tags = self.collection().tags.canonify(note_data['tags'])
+
+                self.collection().update_note(anki_note, skip_undo_entry=True)
+                self._dispatch_webhook_event('noteUpdated', {'noteId': anki_note.id, 'note': anki_note.fields}) # Webhook
+                count += 1
+            except Exception:
+                continue
+        
+        return count
 
     @util.api()
     def updateNoteModel(self, note):
@@ -1523,6 +1612,24 @@ class AnkiConnect:
 
 
     @util.api()
+    def findNotesStructured(self, query):
+        query_parts = []
+        if query.get('deck'):
+            query_parts.append(f'deck:"{query["deck"]}"')
+        if query.get('model'):
+            query_parts.append(f'model:"{query["model"]}"')
+        if query.get('tags'):
+            for tag in query['tags']:
+                query_parts.append(f'tag:{tag}')
+        if query.get('fields'):
+            for field, value in query['fields'].items():
+                query_parts.append(f'{field}:"{value}"')
+        
+        full_query = " ".join(query_parts)
+        return self.findNotes(full_query)
+
+
+    @util.api()
     def findCards(self, query=None, fields=None, noteFields=None):
         if query is None:
             return []
@@ -1740,6 +1847,7 @@ class AnkiConnect:
                 card = self.getCard(cid)
                 card.start_timer()
                 scheduler.answerCard(card, ease)
+                self._dispatch_webhook_event('cardReviewed', {'cardId': cid, 'ease': ease, 'newInterval': card.ivl}) # Webhook
                 success.append(True)
             except NotFoundError:
                 success.append(False)
@@ -1953,6 +2061,7 @@ class AnkiConnect:
     @util.api()
     def deleteNotes(self, notes):
         self.collection().remove_notes(notes)
+        self._dispatch_webhook_event('noteDeleted', {'noteIds': notes}) # Webhook
 
 
     @util.api()

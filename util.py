@@ -21,6 +21,9 @@ import anki.sync
 import aqt
 import enum
 import itertools
+import urllib.request
+import urllib.error
+import json
 
 #
 # Utilities
@@ -78,6 +81,7 @@ DEFAULT_CONFIG = {
     'webCorsOriginList': ['http://localhost'],
     'ignoreOriginList': [],
     'webTimeout': 10000,
+    'webhooks': [] # Add webhooks to default config
 }
 
 def setting(key):
@@ -86,6 +90,44 @@ def setting(key):
     except:
         raise Exception('setting {} not found'.format(key))
 
+# Webhook management functions
+def get_webhooks():
+    return aqt.mw.addonManager.getConfig(__name__).get('webhooks', [])
+
+def save_webhooks(webhooks_list):
+    config = aqt.mw.addonManager.getConfig(__name__)
+    config['webhooks'] = webhooks_list
+    aqt.mw.addonManager.writeConfig(__name__, config)
+
+def add_webhook(url, events):
+    webhooks = get_webhooks()
+    # Check if webhook with this URL already exists
+    for webhook in webhooks:
+        if webhook['url'] == url:
+            webhook['events'] = list(set(webhook['events'] + events)) # Merge events
+            save_webhooks(webhooks)
+            return
+    webhooks.append({'url': url, 'events': events})
+    save_webhooks(webhooks)
+
+def remove_webhook(url):
+    webhooks = get_webhooks()
+    webhooks = [wh for wh in webhooks if wh['url'] != url]
+    save_webhooks(webhooks)
+
+def send_webhook_post(url, event_name, event_data):
+    try:
+        headers = {'Content-Type': 'application/json'}
+        data = {'event': event_name, 'data': event_data}
+        req = urllib.request.Request(url, data=json.dumps(data).encode('utf-8'), headers=headers, method='POST')
+        with urllib.request.urlopen(req, timeout=setting('webTimeout') / 1000) as response:
+            # Optionally log response status or content
+            pass
+    except urllib.error.URLError as e:
+        # Log error, but don't crash Anki
+        print(f"Webhook POST to {url} failed for event {event_name}: {e.reason}")
+    except Exception as e:
+        print(f"Webhook POST to {url} failed for event {event_name}: {e}")
 
 # see https://github.com/FooSoft/anki-connect/issues/308
 # fixed in https://github.com/ankitects/anki/commit/0b2a226d
