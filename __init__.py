@@ -85,7 +85,7 @@ class AnkiConnect:
         except:
             QMessageBox.critical(
                 self.window(),
-                'AnkiConnect',
+                'Bomi-AnkiConnect',
                 'Failed to listen on port {}.\nMake sure it is available and is not in use.'.format(util.setting('webBindPort'))
             )
 
@@ -429,7 +429,7 @@ class AnkiConnect:
         else:  # prompt the user
             msg = QMessageBox(None)
             msg.setWindowTitle("A website wants to access to Anki")
-            msg.setText('"{}" requests permission to use Anki through AnkiConnect. Do you want to give it access?'.format(origin))
+            msg.setText('"{}" requests permission to use Anki through Bomi-AnkiConnect. Do you want to give it access?'.format(origin))
             msg.setInformativeText("By granting permission, you'll allow the website to modify your collection on your behalf, including the execution of destructive actions such as deck deletion.")
             msg.setWindowIcon(self.window().windowIcon())
             msg.setIcon(QMessageBox.Icon.Question)
@@ -618,20 +618,46 @@ class AnkiConnect:
 
     @util.api()
     def deleteDecks(self, decks, cardsToo=False):
-        if not cardsToo:
-            # since f592672fa952260655881a75a2e3c921b2e23857 (2.1.28)
-            # (see anki$ git log "-Gassert cardsToo")
-            # you can't delete decks without deleting cards as well.
-            # however, since 62c23c6816adf912776b9378c008a52bb50b2e8d (2.1.45)
-            # passing cardsToo to `rem` (long deprecated) won't raise an error!
-            # this is dangerous, so let's raise our own exception
-            raise Exception("Since Anki 2.1.28 it's not possible "
-                            "to delete decks without deleting cards as well")
+        # Filter decks only. Normal (home) deck deletion is blocked in this
+        # build to prevent accidental card loss. Filter decks release their
+        # cards back to the original home deck automatically on removal,
+        # so no card is ever destroyed by this action.
+        if cardsToo:
+            raise Exception(
+                "cardsToo=True is not allowed in Bomi-AnkiConnect: "
+                "card deletion via deleteDecks is blocked by design."
+            )
         self.startEditing()
-        decks = filter(lambda d: d in self.deckNames(), decks)
+        collection = self.collection()
+        existing_names = self.deckNames()
+        decks = [d for d in decks if d in existing_names]
+
         for deck in decks:
-            did = self.decks().id(deck)
-            self.decks().remove([did])
+            did = collection.decks.id_for_name(deck)
+            if did is None:
+                continue
+            deck_obj = collection.decks.get(did)
+            if not bool(deck_obj.get('dyn', 0)):
+                raise Exception(
+                    'Refusing to delete normal deck "{}": only filter decks '
+                    'can be deleted. Move cards manually or use a filter deck.'.format(deck)
+                )
+            collection.decks.remove([did])
+
+
+    @util.api()
+    def renameDeck(self, oldName, newName):
+        # Rename a deck. Handles subdeck path updates automatically.
+        self.startEditing()
+        collection = self.collection()
+        if oldName not in self.deckNames():
+            raise Exception('Deck not found: {}'.format(oldName))
+        if newName in self.deckNames():
+            raise Exception('Target deck already exists: {}'.format(newName))
+        did = collection.decks.id_for_name(oldName)
+        if did is None:
+            raise Exception('Deck not found: {}'.format(oldName))
+        collection.decks.rename(did, newName)
 
 
     @util.api()
